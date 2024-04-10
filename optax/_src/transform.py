@@ -21,6 +21,7 @@ import chex
 import jax
 from jax import tree_util as jtu
 import jax.numpy as jnp
+import jax.scipy as jsp
 
 from optax import tree_utils as otu
 from optax._src import base
@@ -1415,7 +1416,7 @@ class GaussNewtonState(NamedTuple):
   count: chex.Array
 
 def scale_by_gauss_newton(
-    linear_solver: Callable = jax.scipy.sparse.linalg.cg,
+    linear_solver: Callable = jsp.sparse.linalg.cg,
     is_compositional: bool = False,
     use_normal_eqs: bool = True,
 ) -> base.GradientTransformationExtraArgs:
@@ -1503,7 +1504,7 @@ class ScaleByMadsenTrustRegionState(NamedTuple):
   value: Union[float, jax.Array]
 
 def scale_by_madsen_trust_region(
-    gn_optimizer: base.GradientTransformation,
+    gn_optimizer: base.GradientTransformationExtraArgs,
     init_damping_parameter: float = 1e-3,
     increase_factor: float = 2.0,
     max_steps: int = 30,
@@ -1572,14 +1573,14 @@ def scale_by_madsen_trust_region(
     value_fn = lambda x: 0.5*jnp.sum(residuals_fn_(x)**2)
     value, grad = jax.value_and_grad(value_fn)(params)
 
-    def cond_fn(val) -> Union[int, jax._src.basearray.Array]:
+    def cond_fn(val):
       updates, search_state = val
       del updates
       accepted = search_state.accepted
       iter_num = search_state.iter_num
       return (~accepted) & (iter_num <= max_steps)
 
-    def body_fn(val) -> ScaleByMadsenTrustRegionState:
+    def body_fn(val):
       updates, search_state = val
       damping_parameter = search_state.damping_parameter
       increase_factor = search_state.increase_factor
