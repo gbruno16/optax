@@ -1851,6 +1851,7 @@ def gauss_newton(
     linear_solver: Callable = jsp.sparse.linalg.cg,
     is_compositional: bool = False,
     use_normal_eqs: bool = True,
+    damping_parameter: float = 0.,
 ) -> base.GradientTransformationExtraArgs:
   """The Gauss-Newton optimizer.
 
@@ -1869,6 +1870,7 @@ def gauss_newton(
     linear_solver=linear_solver,
     is_compositional=is_compositional,
     use_normal_eqs=use_normal_eqs,
+    damping_parameter=damping_parameter,
     )
 
 
@@ -1878,7 +1880,6 @@ def levenberg_marquardt(
     linear_solver: Callable = jsp.sparse.linalg.cg,
     init_damping_parameter: float = 1e-3,
     increase_factor: float = 2.0,
-    max_steps: int = 30,
 ) -> base.GradientTransformationExtraArgs:
   """The Levenberg-Marquardt optimizer.
 
@@ -1898,15 +1899,14 @@ def levenberg_marquardt(
     The Gauss-Newton update.
   """
 
-  opt = transform.scale_by_gauss_newton(
+  gn_opt = transform.scale_by_gauss_newton(
     linear_solver=linear_solver,
     is_compositional=is_compositional,
     use_normal_eqs=use_normal_eqs,
+    damping_parameter=init_damping_parameter
     )
 
   return transform.scale_by_madsen_trust_region(
-    gn_optimizer=opt,
-    init_damping_parameter=init_damping_parameter,
+    gn_opt=gn_opt,
     increase_factor=increase_factor,
-    max_steps=max_steps
     )

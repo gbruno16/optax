@@ -1414,11 +1414,13 @@ def scale_by_polyak(
 class GaussNewtonState(NamedTuple):
   """State for scale_by_gauss_newton."""
   count: chex.Array
+  damping_parameter: float
 
 def scale_by_gauss_newton(
     linear_solver: Callable = jsp.sparse.linalg.cg,
     is_compositional: bool = False,
     use_normal_eqs: bool = True,
+    damping_parameter: float = 0.,
 ) -> base.GradientTransformationExtraArgs:
   """Return the Gauss-Newton updates.
     
@@ -1436,7 +1438,9 @@ def scale_by_gauss_newton(
   """
   def init_fn(params):
     del params
-    return GaussNewtonState(count=jnp.zeros([], jnp.int32))
+    return GaussNewtonState(count=jnp.zeros([], jnp.int32),
+                            damping_parameter=damping_parameter,
+                            )
 
   def _make_ridge_gnvp(matvec: Callable, ridge: float = 0.0):
     """Returns the operator equivalent to the sum of matvec and ridge*I."""
@@ -1444,25 +1448,21 @@ def scale_by_gauss_newton(
       return otu.tree_add_scalar_mul(matvec(v), ridge, v)
     return ridge_matvec
 
-  def _build_gnvp(residuals, params, inner_jvp,
-                  outer_grad, outer_hvp, damping_parameter):
+  def _build_gnvp(state, params, inner_jvp, outer_hvp):
     """Builds the matrix and the vector needed for the linear system."""
     inner_vjp_ = jax.linear_transpose(inner_jvp, params)
     inner_vjp = lambda x: inner_vjp_(x)[0]
     if use_normal_eqs:
       if is_compositional:
         gnvp_fn = lambda x: inner_vjp(outer_hvp(inner_jvp(x)))
-        grad = inner_vjp(outer_grad)
       else:
         gnvp_fn = lambda x: inner_vjp(inner_jvp(x))
-        grad = inner_vjp(residuals)
-      gnvp_fn = _make_ridge_gnvp(gnvp_fn, ridge=damping_parameter)
+      gnvp_fn = _make_ridge_gnvp(gnvp_fn, ridge=state.damping_parameter)
     else:
       raise ValueError('Normal equations are still work in progress.')
-    return gnvp_fn, grad
+    return gnvp_fn
 
-  def update_fn(residuals, state, params, *, inner_jvp, damping_parameter=0.,
-                outer_grad=None, outer_hvp=None):
+  def update_fn(grad, state, params, *, inner_jvp, outer_hvp=None):
     """Return the Gauss-Newton updates.
 
     Args:
@@ -1482,32 +1482,31 @@ def scale_by_gauss_newton(
     """
 
     # build gnvp and gradient
-    matvec, b = _build_gnvp(residuals, params, inner_jvp,
-                                    outer_grad, outer_hvp, damping_parameter)
+    matvec = _build_gnvp(state, params, inner_jvp, outer_hvp)
 
     # solve linear system
-    updates = linear_solver(matvec, otu.tree_scalar_mul(-1, b))[0]
+    updates = linear_solver(matvec, otu.tree_scalar_mul(-1, grad))[0]
 
     count_inc = utils.safe_int32_increment(state.count)
-    return updates, GaussNewtonState(count=count_inc)
+    return updates, GaussNewtonState(count=count_inc,
+                                     damping_parameter=state.damping_parameter,
+                                     )
 
   return base.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
 class ScaleByMadsenTrustRegionState(NamedTuple):
   """State for scale_by_madsen_trust_region"""
-  damping_parameter: float
   increase_factor: float
-  gn_optimizer_state: base.OptState
-  accepted: bool
+  gn_opt_state: base.OptState
+  accepted: bool # whether the previous update was accepted or not.
   iter_num: int
-  value: Union[float, jax.Array]
+  last_acc_value: Union[float, jax.Array] # loss value of the last accepted params.
+  prev_updates: base.Updates  # previous proposal updates (that will be tested in the current iteration).
 
 def scale_by_madsen_trust_region(
-    gn_optimizer: base.GradientTransformationExtraArgs,
-    init_damping_parameter: float = 1e-3,
+    gn_opt: base.GradientTransformationExtraArgs,
     increase_factor: float = 2.0,
-    max_steps: int = 30,
 ) -> base.GradientTransformationExtraArgs:
   """Return the Gauss-Newton updates that satify the gain ratio test.
     
@@ -1517,118 +1516,110 @@ def scale_by_madsen_trust_region(
 
     Args:
       gn_optimizer: instance of scale_by_gauss_newton GradientTransformation.
-      init_damping_parameter: initial value for the damping parameter.
       increase_factor: initial value for the increase factor.
-      max_steps: maximum number of iterations before stopping the search loop.
     Returns:
       The Gauss-Newton update.
   """
   def init_fn(params: base.Params) -> ScaleByMadsenTrustRegionState:
     return ScaleByMadsenTrustRegionState(
-        damping_parameter=init_damping_parameter,
-        increase_factor=increase_factor,
-        gn_optimizer_state=gn_optimizer.init(params),
-        accepted=False,
-        iter_num=jnp.zeros([], jnp.int32),
-        value=jnp.array(jnp.inf),
-    )
+                                  increase_factor=increase_factor,
+                                  gn_opt_state=gn_opt.init(params),
+                                  accepted=True,
+                                  iter_num=jnp.zeros([], jnp.int32),
+                                  last_acc_value=jnp.array(jnp.inf),
+                                  prev_updates=otu.tree_zeros_like(params),
+                                  )
 
-  def _gain_ratio(value, value_new, updates, grad, mu):
-    gain_ratio_denom = 0.5 * otu.tree_vdot(updates,
-      otu.tree_sub(otu.tree_scalar_mul(mu, updates), grad))
-    return (value - value_new) /  gain_ratio_denom
+  def _gain_ratio(value, grad, state):
+    mu = state.gn_opt_state.damping_parameter
+    gain_ratio_denom = 0.5 * otu.tree_vdot(state.prev_updates,
+      otu.tree_sub(otu.tree_scalar_mul(mu, state.prev_updates), grad))
+    return (state.last_acc_value - value) /  gain_ratio_denom
 
-  def _gain_ratio_test_true(updates, mu, nu, rho):
-    del nu
+  def _gain_ratio_test_true(grad, state, params, inner_jvp, outer_hvp, rho):
+    del params, inner_jvp, outer_hvp
+    # update damping parameter
+    mu = state.gn_opt_state.damping_parameter
     mu = mu * jnp.maximum(1/3, 1-(2*rho-1)**3)
-    nu = 2.0
-    accepted = True
-    return updates, accepted, mu, nu
+    gn_opt_state = GaussNewtonState(count=state.gn_opt_state.count,
+                                          damping_parameter=mu)
+    # update trust region state
+    iter_num_inc = utils.safe_int32_increment(state.iter_num)
+    state = ScaleByMadsenTrustRegionState(increase_factor=2.0,
+                                          gn_opt_state=gn_opt_state,
+                                          accepted=True,
+                                          iter_num=iter_num_inc,
+                                          last_acc_value=state.last_acc_value,
+                                          prev_updates=state.prev_updates)
+    # keep the new params: we need to wait for the new grads and jvp computed
+    # by the user.
+    updates = otu.tree_zeros_like(grad)
+    return updates, state
 
-  def _gain_ratio_test_false(updates, mu, nu, rho):
+  def _gain_ratio_test_false(grad, state, params, inner_jvp, outer_hvp, rho):
     del rho
+    mu = state.gn_opt_state.damping_parameter
+    nu = state.increase_factor
+    # update damping parameter
     mu = mu * nu
     nu = 2 * nu
-    accepted = False
-    return otu.tree_zeros_like(updates), accepted, mu, nu
-
-  def update_fn(
-    search_state: ScaleByMadsenTrustRegionState,
-    params: base.Params,
-    *,
-    residuals_fn: Callable[..., Union[jax.Array, float]],
-    **extra_args: dict[str, Any],
-  ) -> tuple[base.Updates, ScaleByMadsenTrustRegionState]:
-    """Compute updates that satisfy the gain ratio test."""
-
-    # fetch arguments to be fed to residuals_fn from the extra_args
-    (fn_kwargs,), remaining_kwargs = utils._extract_fns_kwargs(  # pylint: disable=protected-access
-        (residuals_fn,), extra_args
-    )
-    del remaining_kwargs
-    residuals_fn_ = functools.partial(residuals_fn, **fn_kwargs)
-
-    # compute value and grad for the current params
-    residuals, inner_jvp = jax.linearize(residuals_fn_, params)
-    value_fn = lambda x: 0.5*jnp.sum(residuals_fn_(x)**2)
-    value, grad = jax.value_and_grad(value_fn)(params)
-
-    def cond_fn(val):
-      updates, search_state = val
-      del updates
-      accepted = search_state.accepted
-      iter_num = search_state.iter_num
-      return (~accepted) & (iter_num <= max_steps)
-
-    def body_fn(val):
-      updates, search_state = val
-      damping_parameter = search_state.damping_parameter
-      increase_factor = search_state.increase_factor
-      value = search_state.value
-      iter_num = search_state.iter_num
-      opt_state = search_state.gn_optimizer_state
-
-      # compute GN update with current damping parameter
-      updates_new, opt_state = gn_optimizer.update(residuals, opt_state, params,
-                                            inner_jvp=inner_jvp,
-                                            damping_parameter=damping_parameter)
-      value_new = value_fn(optax_update.apply_updates(params, updates_new))
-
-      # apply gain ratio test
-      rho = _gain_ratio(value, value_new, updates, grad, damping_parameter)
-      updates_new, accepted, damping_parameter, increase_factor = jax.lax.cond(
-                                                      rho > 0,
-                                                      _gain_ratio_test_true,
-                                                      _gain_ratio_test_false,
-                                                      updates_new,
-                                                      damping_parameter,
-                                                      increase_factor, rho,
-                                                      )
-
-      iter_num_inc = utils.safe_int32_increment(iter_num)
-      search_state = ScaleByMadsenTrustRegionState(
-                                          damping_parameter=damping_parameter,
-                                          increase_factor=increase_factor,
-                                          gn_optimizer_state=opt_state,
-                                          accepted=accepted,
+    gn_opt_state = GaussNewtonState(count=state.gn_opt_state.count,
+                                    damping_parameter=mu)
+    # compute new proposal updates
+    new_solution, gn_opt_state = gn_opt.update(grad,
+                                              gn_opt_state,
+                                              params,
+                                              inner_jvp=inner_jvp,
+                                              outer_hvp=outer_hvp)
+    # come back to the last accepted params before adding the new solution
+    updates = otu.tree_sub(new_solution, state.prev_updates)
+    # update trust region state
+    iter_num_inc = utils.safe_int32_increment(state.iter_num)
+    state = ScaleByMadsenTrustRegionState(increase_factor=nu,
+                                          gn_opt_state=gn_opt_state,
+                                          accepted=False,
                                           iter_num=iter_num_inc,
-                                          value=value,
-                                      )
-      return updates_new, search_state
+                                          last_acc_value=state.last_acc_value,
+                                          prev_updates=new_solution)
+    return updates, state
 
-    search_state = ScaleByMadsenTrustRegionState(
-                            damping_parameter=search_state.damping_parameter,
-                            increase_factor=search_state.increase_factor,
-                            gn_optimizer_state=search_state.gn_optimizer_state,
-                            accepted=False,
-                            iter_num=jnp.zeros([], jnp.int32),
-                            value=value,
-                        )
+  def _apply_gain_ratio_test(grad, state, params, value, inner_jvp, outer_hvp):
+    rho = _gain_ratio(value, grad, state)
+    updates, state = jax.lax.cond(rho > 0,
+                              _gain_ratio_test_true,
+                              _gain_ratio_test_false,
+                              grad, state, params, inner_jvp, outer_hvp, rho)
+    return updates, state
 
-    # start search for damping parameter
-    updates, search_state = jax.lax.while_loop(cond_fn, body_fn,
-                              (otu.tree_zeros_like(params), search_state))
-    return updates, search_state
+  def _search_restart(grad, state, params, value, inner_jvp, outer_hvp=None):
+    # when last step is accepted, we don't have any gain ratio to check.
+    # However we need to update the trust region state (and compute a new solution).
+
+    # compute new updates
+    updates, gn_opt_state = gn_opt.update(grad, state.gn_opt_state, params,
+                                          inner_jvp=inner_jvp,
+                                          outer_hvp=outer_hvp)
+    # update trust region state (restart)
+    state = ScaleByMadsenTrustRegionState(
+                                        increase_factor=state.increase_factor,
+                                        gn_opt_state=gn_opt_state,
+                                        accepted=False,
+                                        iter_num=jnp.ones([], jnp.int32),
+                                        last_acc_value=value,
+                                        prev_updates=updates,
+                                        )
+    return updates, state
+
+  def update_fn(grad, state, params, *, value, inner_jvp, outer_hvp=None):
+    """Check if the previous updates satisfy the gain ratio test. 
+    - If yes return zero updates and wait for new grads and jvp. 
+      Then restart the search state with the new info and return new proposal updates.
+    - If no compute new proposal updates."""
+    updates, state = jax.lax.cond(state.accepted,
+                              _search_restart,
+                              _apply_gain_ratio_test,
+                              grad, state, params, value, inner_jvp, outer_hvp)
+    return updates, state
 
   return base.GradientTransformationExtraArgs(init_fn, update_fn)
 
