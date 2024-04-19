@@ -1495,18 +1495,29 @@ def scale_by_gauss_newton(
 
 class ScaleByMadsenTrustRegionState(NamedTuple):
   """State for scale_by_madsen_trust_region"""
-  damping_parameter: float
-  increase_factor: float
-  gn_optimizer_state: base.OptState
-  accepted: bool
-  iter_num: int
+  damping_parameter: Union[float, jax.Array]
+  increase_factor: Union[float, jax.Array]
   value: Union[float, jax.Array]
+  grad: Optional[base.Updates] = None
+  inner_jvp: Callable = None
+  outer_hvp: Callable = None
+
+class TrustRegionSearchState(NamedTuple):
+  """State during the inner loop of a backtracking line-search."""
+  damping_parameter: Union[float, jax.Array]
+  increase_factor: Union[float, jax.Array]
+  new_value: Union[float, jax.Array]
+  new_grad: Optional[base.Updates] = None
+  new_inner_jvp: Callable
+  new_outer_hvp: Callable
+  accepted: bool
+  iter_num: Union[int, jax.Array]
 
 def scale_by_madsen_trust_region(
-    gn_optimizer: base.GradientTransformation,
     init_damping_parameter: float = 1e-3,
     increase_factor: float = 2.0,
-    max_steps: int = 30,
+    max_trust_region_steps: int = 30,
+    store_grad: bool = False,
 ) -> base.GradientTransformationExtraArgs:
   """Return the Gauss-Newton updates that satify the gain ratio test.
     
@@ -1523,13 +1534,21 @@ def scale_by_madsen_trust_region(
       The Gauss-Newton update.
   """
   def init_fn(params: base.Params) -> ScaleByMadsenTrustRegionState:
+    if store_grad:
+      grad = otu.tree_zeros_like(params)
+      inner_jvp = None # TODO: check the correct value
+      outer_hvp = None # TODO: check the correct value
+    else:
+      grad = None
+      inner_jvp = None
+      outer_hvp = None
     return ScaleByMadsenTrustRegionState(
         damping_parameter=init_damping_parameter,
         increase_factor=increase_factor,
-        gn_optimizer_state=gn_optimizer.init(params),
-        accepted=False,
-        iter_num=jnp.zeros([], jnp.int32),
         value=jnp.array(jnp.inf),
+        grad=grad,
+        inner_jvp=inner_jvp,
+        outer_hvp=outer_hvp,
     )
 
   def _gain_ratio(value, value_new, updates, grad, mu):
@@ -1552,57 +1571,75 @@ def scale_by_madsen_trust_region(
     return otu.tree_zeros_like(updates), accepted, mu, nu
 
   def update_fn(
-    search_state: ScaleByMadsenTrustRegionState,
+    grad: base.Updates,
+    state: ScaleByMadsenTrustRegionState,
     params: base.Params,
     *,
-    residuals_fn: Callable[..., Union[jax.Array, float]],
+    value: Union[float, jax.Array],
+    inner_jvp: Callable,
+    inner_fn: Callable[..., Union[jax.Array, float]],
+    outer_hvp: Callable = None,
+    outer_fn: Callable[..., Union[jax.Array, float]] = None,
+    is_compositional: bool = False,
     **extra_args: dict[str, Any],
   ) -> tuple[base.Updates, ScaleByMadsenTrustRegionState]:
     """Compute updates that satisfy the gain ratio test."""
 
     # fetch arguments to be fed to residuals_fn from the extra_args
-    (fn_kwargs,), remaining_kwargs = utils._extract_fns_kwargs(  # pylint: disable=protected-access
-        (residuals_fn,), extra_args
-    )
+    (inner_fn_kwargs,), remaining_kwargs = utils._extract_fns_kwargs(  # pylint: disable=protected-access
+        (inner_fn, ), extra_args
+    ) # TODO: add outer_fn
     del remaining_kwargs
-    residuals_fn_ = functools.partial(residuals_fn, **fn_kwargs)
+    """"
+    # TODO: replace the following
+    inner_fn_ = functools.partial(inner_fn, **inner_fn_kwargs)
 
     # compute value and grad for the current params
     residuals, inner_jvp = jax.linearize(residuals_fn_, params)
     value_fn = lambda x: 0.5*jnp.sum(residuals_fn_(x)**2)
     value, grad = jax.value_and_grad(value_fn)(params)
-
-    def cond_fn(val) -> Union[int, jax._src.basearray.Array]:
-      updates, search_state = val
+    """
+    def cond_fn(updates_and_state) -> Union[int, jax._src.basearray.Array]:
+      updates, search_state = updates_and_state
       del updates
       accepted = search_state.accepted
       iter_num = search_state.iter_num
-      return (~accepted) & (iter_num <= max_steps)
+      return (~accepted) & (iter_num <= max_trust_region_steps)
 
-    def body_fn(val) -> ScaleByMadsenTrustRegionState:
-      updates, search_state = val
+    def body_fn(updates_and_state) -> ScaleByMadsenTrustRegionState:
+      updates, search_state = updates_and_state
       damping_parameter = search_state.damping_parameter
       increase_factor = search_state.increase_factor
-      value = search_state.value
+      new_grad = search_state.new_grad
+      new_inner_jvp = search_state.new_inner_jvp
+      new_outer_hvp = search_state.new_outer_hvp
       iter_num = search_state.iter_num
-      opt_state = search_state.gn_optimizer_state
 
       # compute GN update with current damping parameter
-      updates_new, opt_state = gn_optimizer.update(residuals, opt_state, params,
+      # TODO: replace optimizer
+      updates = gn_optimizer.update(residuals, opt_state, params,
                                             inner_jvp=inner_jvp,
                                             damping_parameter=damping_parameter)
-      value_new = value_fn(optax_update.apply_updates(params, updates_new))
+      
+      new_params = otu.apply_updates(params, updates)
 
-      # apply gain ratio test
-      rho = _gain_ratio(value, value_new, updates, grad, damping_parameter)
-      updates_new, accepted, damping_parameter, increase_factor = jax.lax.cond(
-                                                      rho > 0,
-                                                      _gain_ratio_test_true,
-                                                      _gain_ratio_test_false,
-                                                      updates_new,
-                                                      damping_parameter,
-                                                      increase_factor, rho,
-                                                      )
+      inner_fn_ = functools.partial(inner_fn, **inner_fn_kwargs)
+      if is_compositional:
+        outer_fn = functools.partial(outer_fn, **outer_fn_kwargs)
+      
+      if store_grad:
+        new_value, inner_jvp = jax.linearize(inner_fn_, new_params)
+        # [ ]: keep going
+        # apply gain ratio test
+        rho = _gain_ratio(value, value_new, updates, grad, damping_parameter)
+        updates_new, accepted, damping_parameter, increase_factor = jax.lax.cond(
+                                                        rho > 0,
+                                                        _gain_ratio_test_true,
+                                                        _gain_ratio_test_false,
+                                                        updates_new,
+                                                        damping_parameter,
+                                                        increase_factor, rho,
+                                                        )
 
       iter_num_inc = utils.safe_int32_increment(iter_num)
       search_state = ScaleByMadsenTrustRegionState(
