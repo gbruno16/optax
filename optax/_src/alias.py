@@ -1850,7 +1850,6 @@ def polyak_sgd(
 def gauss_newton(
     linear_solver: Callable = jsp.sparse.linalg.cg,
     is_compositional: bool = False,
-    use_normal_eqs: bool = True,
 ) -> base.GradientTransformationExtraArgs:
   """The Gauss-Newton optimizer.
 
@@ -1860,7 +1859,6 @@ def gauss_newton(
   Args:
     is_compositional: if true solve a compositional problem (needs outer_hvp),
       else solve a classical least squares.
-    use_normal_eqs: if true solve the normal equations.
     linear_solver: instance of linear solver (e.g. jsp.sparse.linalg.cg).
   Returns:
     The Gauss-Newton update.
@@ -1868,17 +1866,15 @@ def gauss_newton(
   return transform.scale_by_gauss_newton(
     linear_solver=linear_solver,
     is_compositional=is_compositional,
-    use_normal_eqs=use_normal_eqs,
     )
 
 
-def levenberg_marquardt(
-    is_compositional: bool = False,
-    use_normal_eqs: bool = True,
-    linear_solver: Callable = jsp.sparse.linalg.cg,
+def gauss_newton_with_trust_region(
     init_damping_parameter: float = 1e-3,
     increase_factor: float = 2.0,
     max_steps: int = 30,
+    linear_solver: Callable = jsp.sparse.linalg.cg,
+    is_compositional: bool = False,
 ) -> base.GradientTransformationExtraArgs:
   """The Levenberg-Marquardt optimizer.
 
@@ -1898,15 +1894,10 @@ def levenberg_marquardt(
     The Gauss-Newton update.
   """
 
-  opt = transform.scale_by_gauss_newton(
-    linear_solver=linear_solver,
-    is_compositional=is_compositional,
-    use_normal_eqs=use_normal_eqs,
-    )
-
-  return transform.scale_by_madsen_trust_region(
-    gn_optimizer=opt,
+  return transform.scale_by_gauss_newton_with_trust_region(
     init_damping_parameter=init_damping_parameter,
     increase_factor=increase_factor,
-    max_steps=max_steps
+    max_steps=max_steps,
+    linear_solver=linear_solver,
+    is_compositional=is_compositional,
     )
